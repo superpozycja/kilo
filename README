@@ -1,5 +1,10 @@
                                       kilo
 
 implementation of [1]. might sprinkle in some of my own stuff here
+my current own stuff:
+
+	custom die(),
+	mode support,
+	simplified vim bindings	
 
 [1]: https://viewsourcecode.org/snaptoken/kilo/index.html

@@ -221,7 +221,7 @@ void editor_move_cursor(int key)
 		break;
 	case ARROW_DOWN:
 	case 'j':
-		estate.cy = estate.cy < estate.scr_rows ? estate.cy + 1 : 0;
+		estate.cy = estate.cy < estate.scr_rows - 2 ? estate.cy + 1 : estate.scr_rows - 2;
 		break;
 	case ARROW_UP:
 	case 'k':
@@ -229,7 +229,7 @@ void editor_move_cursor(int key)
 		break;
 	case ARROW_RIGHT:
 	case 'l':
-		estate.cx = estate.cx < estate.scr_cols ? estate.cx + 1 : 0;
+		estate.cx = estate.cx < estate.scr_cols - 1? estate.cx + 1 : estate.scr_cols - 1;
 		break;
 	}
 }
@@ -293,7 +293,7 @@ void editor_process_keypress()
 void editor_draw_rows(struct abuf *ab)
 {
 	int y;
-	for (y = 0; y < estate.scr_rows-1; y++) {
+	for (y = 0; y < estate.scr_rows; y++) {
 		if (y == estate.scr_rows / 5) {
 			char msg[80];
 			int msglen = snprintf(msg,
@@ -314,8 +314,8 @@ void editor_draw_rows(struct abuf *ab)
 		} 
 		/* clr line */
 		abuf_append(ab, "\x1b[K", 3);
-		if (y < estate.scr_rows - 1)
-			abuf_append(ab, "\r\n", 2);
+		/* if (y < estate.scr_rows - 1) */
+		abuf_append(ab, "\r\n", 2);
 	}
 	char modestr[80];
 	switch (estate.mode) {

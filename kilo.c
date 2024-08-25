@@ -1,13 +1,22 @@
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <ctype.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #define KILO_VERSION "0.0.1"
+#define KILO_TAB_STOP 8
+
 /* my little addition */
 #define die(s) __die((s), (__func__), (__LINE__))
 #define CTRL_KEY(k) ((k) & 0x1f)
@@ -30,11 +39,26 @@ enum editor_key {
 	PAGE_DOWN,
 };
 
+struct erow {
+	int size;
+	int rsize;
+	char *chars;
+	char *render;
+};
+
 struct editor_state {
 	struct termios default_termios;
+	char *filename;
+	char statusmsg[80];
+	time_t statusmsg_time;
 	int mode;
 	int scr_rows, scr_cols;
 	int cx, cy;
+	int rx;
+	int numrows;
+	int rowoff;
+	int coloff;
+	struct erow *row;
 };
 
 struct abuf {
@@ -214,6 +238,8 @@ int get_window_size(int *rows, int *cols)
 
 void editor_move_cursor(int key)
 {
+	struct erow *row = (estate.cy >= estate.numrows) ? NULL : estate.row + estate.cy;
+
 	switch (key) {
 	case ARROW_LEFT:
 	case 'h':
@@ -221,7 +247,7 @@ void editor_move_cursor(int key)
 		break;
 	case ARROW_DOWN:
 	case 'j':
-		estate.cy = estate.cy < estate.scr_rows - 2 ? estate.cy + 1 : estate.scr_rows - 2;
+		estate.cy = estate.cy < estate.numrows - 1 ? estate.cy + 1 : estate.scr_rows - 1;
 		break;
 	case ARROW_UP:
 	case 'k':
@@ -229,13 +255,21 @@ void editor_move_cursor(int key)
 		break;
 	case ARROW_RIGHT:
 	case 'l':
-		estate.cx = estate.cx < estate.scr_cols - 1? estate.cx + 1 : estate.scr_cols - 1;
+		if (row)
+			estate.cx += estate.cx < row->size;
 		break;
 	}
+
+	row = (estate.cy >= estate.numrows) ? NULL : estate.row + estate.cy;
+	int rowlen = row ? row->size : 0;
+	if (estate.cx > rowlen)
+		estate.cx = rowlen;
 }
 
 void editor_process_keypress()
 {
+	struct erow *row = (estate.cy >= estate.numrows) ? NULL : estate.row + estate.cy;
+
 	int c = editor_read_key();
 	switch (c) {
 	case CTRL_KEY('c'):
@@ -285,63 +319,191 @@ void editor_process_keypress()
 			break;
 		__attribute__ ((fallthrough));
 	case END_KEY:
-		estate.cx = estate.scr_cols - 1;
+		estate.cx = row->size;
 		break;
 	}
+}
+
+void editor_draw_status_bar(struct abuf *ab)
+{
+	char status[80], rstatus[80];
+	int totallen = 0;
+	int len;
+
+	abuf_append(ab, "\x1b[7m", 4);
+	char modestr[80];
+	switch (estate.mode) {
+	case MODE_NORMAL:
+		strcpy(modestr, "             ");
+		break;
+	case MODE_INSERT:
+		strcpy(modestr, "-- INSERT -- ");
+		break;
+	}
+	len = strlen(modestr);
+	totallen += len;
+	if (totallen > estate.scr_cols)
+		len = totallen - estate.scr_cols;
+
+	abuf_append(ab, modestr, len);
+
+	len = snprintf(status, sizeof(status), "%.20s - %d lines",
+			estate.filename ? estate.filename : "[no name]", estate.numrows);
+	totallen += len;
+	if (totallen > estate.scr_cols)
+		len = totallen - estate.scr_cols;
+	abuf_append(ab, status, len);
+
+	int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", estate.cy + 1, estate.numrows);
+
+	while (totallen < estate.scr_cols - 1) {
+		if (estate.scr_cols - totallen == rlen) {
+			abuf_append(ab, rstatus, rlen);
+			break;
+		}
+		abuf_append(ab, " ", 1);
+		totallen++;
+	}
+	abuf_append(ab, "\x1b[m", 3);
+	abuf_append(ab, "\r\n", 2);
+}
+
+void editor_draw_statusmsg(struct abuf *ab)
+{
+	abuf_append(ab, "\x1b[K", 3);
+	int msglen = strlen(estate.statusmsg);
+	if (msglen > estate.scr_cols)
+		msglen = estate.scr_cols;
+	if (msglen && time(NULL) - estate.statusmsg_time < 5)
+		abuf_append(ab, estate.statusmsg, msglen);
 }
 
 void editor_draw_rows(struct abuf *ab)
 {
 	int y;
 	for (y = 0; y < estate.scr_rows; y++) {
-		if (y == estate.scr_rows / 5) {
-			char msg[80];
-			int msglen = snprintf(msg,
-			                      sizeof(msg)/sizeof(char),
-					      "vikilo editor %s", KILO_VERSION);
-			int pad = (estate.scr_cols - msglen) / 2;
-			if (msglen + pad > estate.scr_cols)
-				msglen = estate.scr_cols - pad;
-			if (pad) {
+		int frow = y + estate.rowoff;
+		if (y >= estate.numrows) {
+			if (estate.numrows == 0&& y == estate.scr_rows / 5) {
+				char msg[80];
+				int msglen = snprintf(msg,
+						      sizeof(msg)/sizeof(char),
+						      "vikilo editor %s", KILO_VERSION);
+				int pad = (estate.scr_cols - msglen) / 2;
+				if (msglen + pad > estate.scr_cols)
+					msglen = estate.scr_cols - pad;
+				if (pad) {
+					abuf_append(ab, "~", 1);
+					pad--;
+				}
+				while (pad--)
+					abuf_append(ab, " ", 1);
+				abuf_append(ab, msg, msglen);
+			} else {
 				abuf_append(ab, "~", 1);
-				pad--;
-			}
-			while (pad--)
-				abuf_append(ab, " ", 1);
-			abuf_append(ab, msg, msglen);
+			} 
 		} else {
-			abuf_append(ab, "~", 1);
-		} 
+			int len = estate.row[frow].rsize - estate.coloff;
+			if (len < 0)
+				len = 0;
+			if (len > estate.scr_cols)
+				len = estate.scr_cols;
+			abuf_append(ab, estate.row[frow].render + estate.coloff, len);
+		}
+
 		/* clr line */
 		abuf_append(ab, "\x1b[K", 3);
-		/* if (y < estate.scr_rows - 1) */
 		abuf_append(ab, "\r\n", 2);
 	}
-	char modestr[80];
-	switch (estate.mode) {
-	case MODE_NORMAL:
-		strcpy(modestr, "");
-		break;
-	case MODE_INSERT:
-		strcpy(modestr, "-- INSERT --");
-		break;
+}
+
+int editor_row_cx_to_rx(struct erow *row, int cx)
+{
+	int rx = 0;
+	int j;
+	for (j = 0; j < cx; j++) {
+		if (row->chars[j] == '\t')
+			rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
+		rx++;
 	}
-	abuf_append(ab, "\x1b[K", 3);
-	abuf_append(ab, modestr, strlen(modestr));
+	return rx;
+}
+
+void editor_update_row(struct erow *row)
+{
+	int tabs = 0;
+	int j;
+	for (j = 0; j < row->size; j++)
+		tabs += row->chars[j] == '\t';
+
+	free(row->render);
+	row->render = malloc(row->size + tabs * (KILO_TAB_STOP - 1) + 1);
+
+	int idx = 0;
+	for (j = 0; j < row->size; j++) {
+		if (row->chars[j] == '\t') {
+			row->render[idx++] = ' ';
+			while (idx % KILO_TAB_STOP != 0)
+				row->render[idx++] = ' ';
+		} else {
+			row->render[idx++] = row->chars[j];
+		}
+	}
+	row->render[idx] = '\0';
+	row->rsize = idx;
+}
+
+void editor_append_row(char *s, size_t len)
+{
+	estate.row = realloc(estate.row, sizeof(struct erow) * (estate.numrows + 1));
+
+	int at = estate.numrows;
+	estate.row[at].size = len;
+	estate.row[at].chars = malloc(len + 1);
+	memcpy(estate.row[at].chars, s, len);
+	estate.row[at].chars[len] = '\0';
+
+	estate.row[at].rsize = 0;
+	estate.row[at].render = NULL;
+	editor_update_row(&estate.row[at]);
+
+	estate.numrows++;
+
+}
+
+void editor_scroll()
+{
+	estate.rx = estate.cx;
+	if (estate.cy < estate.numrows)
+		estate.rx = editor_row_cx_to_rx(&estate.row[estate.cy], estate.cx);
+
+	estate.rowoff = estate.cy < estate.rowoff ? estate.cy : estate.rowoff;
+	if (estate.cy >= estate.rowoff + estate.scr_rows)
+		estate.rowoff = estate.cy - estate.scr_rows + 1;
+
+	estate.coloff = estate.cx < estate.coloff ? estate.cx : estate.coloff;
+	if (estate.rx >= estate.coloff + estate.scr_cols)
+		estate.coloff = estate.rx - estate.scr_cols + 1;
+
 }
 
 /* see https://vt100.net/docs/vt100-ug/chapter3.html */
 void editor_refresh_screen()
 {
+	editor_scroll();
+
 	struct abuf ab = ABUF_INIT;
 	/* disable cursor */
 	abuf_append(&ab, "\x1b[?25l", 6);
 	/* reset cursor */
 	abuf_append(&ab, "\x1b[H", 3);
+
 	editor_draw_rows(&ab);
+	editor_draw_status_bar(&ab);
+	editor_draw_statusmsg(&ab);
 
 	char buf[32];
-	snprintf(buf, sizeof(buf)/sizeof(char), "\x1b[%d;%dH", estate.cy + 1, estate.cx + 1);
+	snprintf(buf, sizeof(buf)/sizeof(char), "\x1b[%d;%dH", (estate.cy - estate.rowoff) + 1, (estate.rx - estate.coloff) + 1);
 	abuf_append(&ab, buf, strlen(buf));
 	/* enable cursor */
 	abuf_append(&ab, "\x1b[?25h", 6);
@@ -349,20 +511,62 @@ void editor_refresh_screen()
 	abuf_free(&ab);
 }
 
+void editor_open(char *filename) {
+	free(estate.filename);
+	estate.filename = strdup(filename);
+
+	FILE *fp = fopen(filename, "r");
+	if (!fp)
+		die("fopen");
+	char *line = NULL;
+	size_t linecap = 0;
+	ssize_t linelen;
+	while ((linelen = getline(&line, &linecap, fp)) != -1) {
+		while (linelen > 0 && (line[linelen - 1] == '\n' ||
+				       line[linelen - 1] == '\r'))
+			linelen--;
+		editor_append_row(line, linelen);
+
+	}
+	free(line);
+	fclose(fp);
+}
+
+void editor_set_statusmsg(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(estate.statusmsg, sizeof(estate.statusmsg), fmt, ap);
+	va_end(ap);
+	estate.statusmsg_time = time(NULL);
+}
 
 void init_editor()
 {
 	estate.cx = 0;
 	estate.cy = 0;
+	estate.rx = 0;
+	estate.filename = NULL;
+	estate.statusmsg[0] = '\0';
+	estate.statusmsg_time = 0;
 	estate.mode = MODE_NORMAL;
+	estate.numrows = 0;
+	estate.rowoff = 0;
+	estate.coloff = 0;
+	estate.row = NULL;
 	if (get_window_size(&estate.scr_rows, &estate.scr_cols) == -1)
 		die("get_window_size");
+	estate.scr_rows -= 2;
 }
 
-int main()
+int main(int argc, char *argv[])
 {
 	enable_raw_mode();
 	init_editor();
+	if (argc >= 2)
+		editor_open(argv[1]);
+
+	editor_set_statusmsg("help: ctrl+q to quit");
 
 	while (1) {
 		editor_refresh_screen();
